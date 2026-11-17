@@ -1,8 +1,9 @@
 # MacGamingFixes. `make build` makes build/MacGamingFixes.app, `make dmg` wraps it into the installer,
 # `make test` runs every check.
 PAYLOAD := Sources/MGF/Resources/Payload
-# CrossOver's Wine is x86_64 (it runs under Rosetta), so both libraries are too.
-CC_PAYLOAD := clang -arch x86_64 -O2 -mmacosx-version-min=10.15 -dynamiclib
+# Stable CrossOver's Wine is x86_64 (it runs under Rosetta); preview builds add a native arm64 server
+# and arm64 unix libraries. Both libraries are universal, so one payload fits every one of them.
+CC_PAYLOAD := clang -arch x86_64 -arch arm64 -O2 -mmacosx-version-min=10.15 -dynamiclib
 
 .PHONY: payload build dmg run test site clean
 

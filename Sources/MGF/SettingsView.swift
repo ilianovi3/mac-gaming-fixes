@@ -37,7 +37,10 @@ struct SettingsView: View {
 
     private func load() {
         draft = model.settings
-        if draft.crossoverPath.isEmpty, let found = model.crossover { draft.crossoverPath = (found.bundle.path as NSString).abbreviatingWithTildeInPath }
+        if draft.crossoverPath.isEmpty, let found = model.crossover {
+            draft.crossoverPath = tilde(found)
+            if draft.morePaths == nil { draft.morePaths = model.crossovers.dropFirst().map(tilde) }
+        }
         baseline = draft
         busyCpu = String(format: "%g", draft.busyCpu)
         ioMs = String(format: "%g", draft.ioMs)
@@ -46,7 +49,7 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        let pathProblem = model.crossoverProblem(draft.crossoverPath)
+        let pathProblem = model.crossoverProblem(draft.crossoverPath) ?? (draft.morePaths ?? []).lazy.compactMap(model.crossoverProblem).first
         VStack(alignment: .leading, spacing: 0) {
             HxTabs(items: [("paths", L("paths")), ("fixes", L("fixes")), ("app", L("app"))], selection: $tab).reveal(0)
             ScrollView {
@@ -78,21 +81,50 @@ struct SettingsView: View {
         .onAppear { if !loaded { load() } }
     }
 
+    private func tilde(_ crossover: CrossOver) -> String { (crossover.bundle.path as NSString).abbreviatingWithTildeInPath }
+
+    /// One of the additional bundles, as a field.
+    private func morePath(_ index: Int) -> Binding<String> {
+        Binding(get: { (draft.morePaths ?? []).indices.contains(index) ? draft.morePaths![index] : "" },
+                set: { if (draft.morePaths ?? []).indices.contains(index) { draft.morePaths![index] = $0 } })
+    }
+
     @ViewBuilder private func paths(_ problem: String?) -> some View {
         HStack(alignment: .top, spacing: 8) {
             HxInput(label: L("crossover app"), text: $draft.crossoverPath, prompt: true,
-                    hint: L("crossover %@ · fixes are written inside this bundle", CrossOver(path: draft.crossoverPath).version ?? "?"), error: problem)
+                    hint: L("crossover %@ · fixes are written inside this bundle", CrossOver(path: draft.crossoverPath).version ?? "?"),
+                    error: model.crossoverProblem(draft.crossoverPath))
             HxButton(title: L("browse"), icon: "folder-open") { if let picked = chooseApplication() { draft.crossoverPath = picked } }
             .padding(.top, 23)  // sits on the field's row, under the label
             HxButton(title: L("detect"), icon: "scan-search") {
-                if let found = CrossOver.detect() { draft.crossoverPath = (found.bundle.path as NSString).abbreviatingWithTildeInPath }
+                let found = CrossOver.detectAll()
+                if let first = found.first {
+                    draft.crossoverPath = tilde(first)
+                    draft.morePaths = found.dropFirst().map(tilde)
+                }
             }
             .padding(.top, 23)
         }
+        ForEach(Array((draft.morePaths ?? []).enumerated()), id: \.offset) { index, path in
+            HStack(alignment: .top, spacing: 8) {
+                HxInput(label: L("also patch"), text: morePath(index),
+                        hint: L("crossover %@ · gets the same fixes", CrossOver(path: path).version ?? "?"), error: model.crossoverProblem(path))
+                HxButton(title: L("remove"), icon: "x") { draft.morePaths?.remove(at: index) }
+                .padding(.top, 23)
+            }
+        }
+        HxButton(title: L("add another crossover"), icon: "folder-open") {
+            if let picked = chooseApplication() { draft.morePaths = (draft.morePaths ?? []) + [picked] }
+        }
         VStack(alignment: .leading, spacing: 6) {
-            let crossover = CrossOver(path: draft.crossoverPath)
-            derived("wineserver", crossover.wineserver)
-            derived(L("audio driver"), crossover.audioDriver)
+            let bundles = ([draft.crossoverPath] + (draft.morePaths ?? [])).map(CrossOver.init(path:))
+            ForEach(Array(bundles.enumerated()), id: \.offset) { _, crossover in
+                let servers = crossover.wineservers, drivers = crossover.audioDrivers
+                if servers.isEmpty { derived("wineserver", crossover.bin.appendingPathComponent("wineserver")) }
+                ForEach(servers, id: \.self) { derived($0.lastPathComponent, $0) }
+                if drivers.isEmpty { derived(L("audio driver"), crossover.support.appendingPathComponent("lib/wine/x86_64-unix/winecoreaudio.so")) }
+                ForEach(drivers, id: \.self) { derived(L("audio driver"), $0) }
+            }
         }
         .padding(12).frame(maxWidth: .infinity, alignment: .leading)
         .overlay(RoundedRectangle(cornerRadius: Hax.radiusMD).strokeBorder(Hax.borderDefault, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))

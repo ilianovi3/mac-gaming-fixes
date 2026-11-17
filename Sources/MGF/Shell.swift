@@ -270,7 +270,7 @@ private struct ConfirmDialog: View {
         let applying = kind == .apply
         let ids = applying ? model.missingFixes : model.appliedFixes
         HxDialog(title: applying ? L("apply recommended") : L("revert all"),
-                 path: (model.crossover?.support.path as NSString?)?.abbreviatingWithTildeInPath ?? "", onClose: { model.confirm = nil }) {
+                 path: model.crossovers.map { ($0.support.path as NSString).abbreviatingWithTildeInPath }.joined(separator: "\n"), onClose: { model.confirm = nil }) {
             Text(verbatim: applying ? L("these files inside crossover will change. originals are kept next to them.")
                                     : L("these files go back to their originals. wrappers and copies are removed."))
             VStack(spacing: 0) {
