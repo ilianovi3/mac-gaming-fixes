@@ -3,26 +3,36 @@ import Testing
 @testable import MGFCore
 
 /// A throwaway CrossOver bundle: /usr/bin/true stands in for the Wine server, so the real
-/// xattr and codesign steps run against a real signed Mach-O.
+/// xattr and codesign steps run against a real signed Mach-O. `preview` lays it out like a
+/// CrossOver Preview build: wineserver-x86 and wineserver-arm64, and an aarch64-unix next to x86_64-unix.
 struct FakeCrossOver {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("mgf-test-\(UUID().uuidString)")
     let crossover: CrossOver
     let fixes: Fixes
+    let payload: URL
     let serverBytes: Data
     let driverBytes = Data("stock audio driver __wine_unix_call_funcs".utf8)
 
-    init() throws {
+    init(preview: Bool = false, name: String = "CrossOver.app") throws {
         let fm = FileManager.default
-        crossover = CrossOver(bundle: root.appendingPathComponent("CrossOver.app"))
-        let payload = root.appendingPathComponent("payload")
-        for dir in [crossover.bin, crossover.unixLibs, payload] { try fm.createDirectory(at: dir, withIntermediateDirectories: true) }
-        try fm.copyItem(atPath: "/usr/bin/true", toPath: crossover.wineserver.path)
-        serverBytes = try Data(contentsOf: crossover.wineserver)
-        try driverBytes.write(to: crossover.audioDriver)
+        let crossover = CrossOver(bundle: root.appendingPathComponent(name)), payload = root.appendingPathComponent("payload")
+        self.crossover = crossover
+        self.payload = payload
+        let servers = preview ? ["wineserver-x86", "wineserver-arm64"] : ["wineserver"]
+        let unixDirs = (preview ? ["x86_64-unix", "aarch64-unix"] : ["x86_64-unix"])
+            .map { crossover.support.appendingPathComponent("lib/wine").appendingPathComponent($0) }
+        for dir in [crossover.bin, payload] + unixDirs { try fm.createDirectory(at: dir, withIntermediateDirectories: true) }
+        for server in servers { try fm.copyItem(atPath: "/usr/bin/true", toPath: crossover.bin.appendingPathComponent(server).path) }
+        serverBytes = try Data(contentsOf: URL(fileURLWithPath: "/usr/bin/true"))
+        for dir in unixDirs { try driverBytes.write(to: dir.appendingPathComponent("winecoreaudio.so")) }
         try Data("fix dylib".utf8).write(to: payload.appendingPathComponent("wineserver_fix.dylib"))
         try Data("audio wrapper".utf8).write(to: payload.appendingPathComponent("winecoreaudio.so"))
         fixes = Fixes(crossover: crossover, payload: payload)
     }
+
+    var server: URL { crossover.wineservers[0] }
+    var unix: URL { crossover.unixLibDirs[0] }
+    var driver: URL { crossover.audioDrivers[0] }
 
     func names(in dir: URL) -> [String] { ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).sorted() }
     func cleanUp() { try? FileManager.default.removeItem(at: root) }
@@ -60,8 +70,8 @@ struct FakeCrossOver {
     try fake.fixes.installWineserver(config)
     #expect(fake.fixes.wineserverConfig() == config)
     #expect(try Data(contentsOf: bin.appendingPathComponent("wineserver.orig")) == fake.serverBytes)
-    #expect(FileManager.default.isExecutableFile(atPath: fake.crossover.wineserver.path))
-    #expect(throws: FixError.self) { try Fixes.run("/usr/bin/codesign", ["-v", bin.appendingPathComponent("wineserver.real").path]) }  // unsigned copy
+    #expect(FileManager.default.isExecutableFile(atPath: fake.server.path))
+    #expect(signature(of: bin.appendingPathComponent("wineserver.real")) == .adHoc)  // runs on Apple silicon, takes DYLD_INSERT_LIBRARIES
     #expect(fake.names(in: bin) == ["wineserver", "wineserver.orig", "wineserver.real", "wineserver_fix.dylib"])
 
     // changing a knob rewrites the wrapper and leaves the original alone
@@ -71,7 +81,7 @@ struct FakeCrossOver {
     #expect(try Data(contentsOf: bin.appendingPathComponent("wineserver.orig")) == fake.serverBytes)
 
     try fake.fixes.uninstallWineserver()
-    #expect(try Data(contentsOf: fake.crossover.wineserver) == fake.serverBytes)
+    #expect(try Data(contentsOf: fake.server) == fake.serverBytes)
     #expect(fake.names(in: bin) == ["wineserver"])
     #expect(fake.fixes.wineserverConfig() == nil)
 }
@@ -79,8 +89,8 @@ struct FakeCrossOver {
 @Test func wineserverFixRefusesAServerItDoesNotRecognise() throws {
     let fake = try FakeCrossOver()
     defer { fake.cleanUp() }
-    try Data("#!/bin/sh\necho someone else's wrapper\n".utf8).write(to: fake.crossover.wineserver)
-    #expect(throws: FixError.unexpected(fake.crossover.wineserver.path)) {
+    try Data("#!/bin/sh\necho someone else's wrapper\n".utf8).write(to: fake.server)
+    #expect(throws: FixError.unexpected(fake.server.path)) {
         try fake.fixes.installWineserver(WineserverConfig(busyCpu: 0.05, udpService: 3, log: nil))
     }
     #expect(fake.names(in: fake.crossover.bin) == ["wineserver"])
@@ -89,12 +99,12 @@ struct FakeCrossOver {
 @Test func audioFixInstallsAndRevertsToTheSameBytes() throws {
     let fake = try FakeCrossOver()
     defer { fake.cleanUp() }
-    let unix = fake.crossover.unixLibs
+    let unix = fake.unix
     #expect(fake.fixes.audioIOms() == nil)
 
     try fake.fixes.installAudio(ioMs: 5.33)
     #expect(fake.fixes.audioIOms() == 5.33)
-    #expect(try Data(contentsOf: fake.crossover.audioDriver) == Data("audio wrapper".utf8))
+    #expect(try Data(contentsOf: fake.driver) == Data("audio wrapper".utf8))
     #expect(try Data(contentsOf: unix.appendingPathComponent("winecoreaudio.so.orig")) == fake.driverBytes)
     #expect(try Data(contentsOf: unix.appendingPathComponent("winecoreaudio_real.so")) == fake.driverBytes)
 
@@ -103,7 +113,7 @@ struct FakeCrossOver {
     #expect(try Data(contentsOf: unix.appendingPathComponent("winecoreaudio.so.orig")) == fake.driverBytes)
 
     try fake.fixes.uninstallAudio()
-    #expect(try Data(contentsOf: fake.crossover.audioDriver) == fake.driverBytes)
+    #expect(try Data(contentsOf: fake.driver) == fake.driverBytes)
     #expect(fake.names(in: unix) == ["winecoreaudio.so"])
 }
 
@@ -122,17 +132,17 @@ struct FakeCrossOver {
     try fake.fixes.installWineserver(WineserverConfig(busyCpu: 0.05, udpService: 3, log: nil))
     try fake.fixes.installAudio(ioMs: 5.33)
     #expect(!quarantined(fake.crossover.bin.appendingPathComponent("wineserver_fix.dylib")))
-    #expect(!quarantined(fake.crossover.audioDriver))
+    #expect(!quarantined(fake.driver))
 }
 
 @Test func writeProbeTellsAllowedFromRefusedWithoutWriting() throws {
     let fake = try FakeCrossOver()
     defer { fake.cleanUp() }
-    let server = fake.crossover.wineserver.path
+    let server = fake.server.path
     #expect(fake.crossover.isWritable == true)
     try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: server)   // refused, as macOS refuses an app without App Management
     #expect(fake.crossover.isWritable == false)
-    #expect(try Data(contentsOf: fake.crossover.wineserver) == fake.serverBytes)
+    #expect(try Data(contentsOf: fake.server) == fake.serverBytes)
     try FileManager.default.removeItem(atPath: server)
     #expect(fake.crossover.isWritable == nil)
 }
@@ -211,4 +221,96 @@ struct FakeCrossOver {
         .command("tail -f /tmp/regsave_defer.log"),
         .note(warning: true, text: "wine games do not always trigger game mode."),
     ])
+}
+
+enum Signature { case none, adHoc, hardened, other }
+
+/// What `codesign -d` says about a binary's signature.
+func signature(of url: URL) -> Signature {
+    let process = Process(), pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    process.arguments = ["-d", "--verbose=2", url.path]
+    process.standardOutput = pipe
+    process.standardError = pipe
+    guard (try? process.run()) != nil else { return .other }
+    let text = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    process.waitUntilExit()
+    if text.contains("not signed") { return .none }
+    if text.contains("runtime") { return .hardened }
+    return text.contains("Signature=adhoc") ? .adHoc : .other
+}
+
+@Test func previewLayoutIsRecognised() throws {
+    let fake = try FakeCrossOver(preview: true, name: "CrossOver Preview.app")
+    defer { fake.cleanUp() }
+    #expect(fake.crossover.isValid)
+    #expect(fake.crossover.wineservers.map(\.lastPathComponent) == ["wineserver-x86", "wineserver-arm64"])
+    #expect(fake.crossover.unixLibDirs.map(\.lastPathComponent) == ["x86_64-unix", "aarch64-unix"])
+    #expect(fake.crossover.isWritable == true)
+}
+
+@Test func previewWineserversAreAllWrappedAndRestored() throws {
+    let fake = try FakeCrossOver(preview: true)
+    defer { fake.cleanUp() }
+    let bin = fake.crossover.bin
+    let config = WineserverConfig(busyCpu: 0.05, udpService: 3, log: nil)
+    try fake.fixes.installWineserver(config)
+    #expect(fake.fixes.wineserverConfig() == config)
+    #expect(fake.names(in: bin) == ["wineserver-arm64", "wineserver-arm64.orig", "wineserver-arm64.real",
+                                    "wineserver-x86", "wineserver-x86.orig", "wineserver-x86.real", "wineserver_fix.dylib"])
+    // never a plain bin/wineserver: bin/wine would pick it over both real servers
+    #expect(!FileManager.default.fileExists(atPath: bin.appendingPathComponent("wineserver").path))
+    for name in ["wineserver-x86", "wineserver-arm64"] {
+        let wrapper = try String(contentsOf: bin.appendingPathComponent(name), encoding: .utf8)
+        #expect(wrapper.contains("exec \"$d/\(name).real\""))
+        #expect(signature(of: bin.appendingPathComponent(name + ".real")) == .adHoc)
+    }
+
+    // one server patched by hand back to stock: the bundle no longer counts as patched
+    try FileManager.default.removeItem(at: bin.appendingPathComponent("wineserver-arm64"))
+    try FileManager.default.moveItem(at: bin.appendingPathComponent("wineserver-arm64.orig"), to: bin.appendingPathComponent("wineserver-arm64"))
+    #expect(fake.fixes.wineserverConfig() == nil)
+    try fake.fixes.installWineserver(config)
+    #expect(fake.fixes.wineserverConfig() == config)
+
+    try fake.fixes.uninstallWineserver()
+    #expect(fake.names(in: bin) == ["wineserver-arm64", "wineserver-x86"])
+    for name in ["wineserver-x86", "wineserver-arm64"] {
+        #expect(try Data(contentsOf: bin.appendingPathComponent(name)) == fake.serverBytes)
+    }
+}
+
+@Test func previewAudioDriversAreAllWrappedAndRestored() throws {
+    let fake = try FakeCrossOver(preview: true)
+    defer { fake.cleanUp() }
+    try fake.fixes.installAudio(ioMs: 5.33)
+    #expect(fake.fixes.audioIOms() == 5.33)
+    for unix in fake.crossover.unixLibDirs {
+        #expect(try Data(contentsOf: unix.appendingPathComponent("winecoreaudio.so")) == Data("audio wrapper".utf8))
+        #expect(try Data(contentsOf: unix.appendingPathComponent("winecoreaudio_real.so")) == fake.driverBytes)
+    }
+    try fake.fixes.uninstallAudio()
+    for unix in fake.crossover.unixLibDirs {
+        #expect(try Data(contentsOf: unix.appendingPathComponent("winecoreaudio.so")) == fake.driverBytes)
+        #expect(fake.names(in: unix) == ["winecoreaudio.so"])
+    }
+}
+
+@Test func fixSetPatchesEveryBundleAndAgreesOnlyWhenTheyMatch() throws {
+    let stable = try FakeCrossOver(), preview = try FakeCrossOver(preview: true)
+    defer { stable.cleanUp(); preview.cleanUp() }
+    let set = FixSet(crossovers: [stable.crossover, preview.crossover], payload: stable.payload)
+    let config = WineserverConfig(busyCpu: 0.05, udpService: 4, log: nil)
+    try set.installWineserver(config)
+    try set.installAudio(ioMs: 4)
+    #expect(set.wineserverConfig() == config)
+    #expect(set.audioIOms() == 4)
+    #expect(stable.fixes.wineserverConfig() == config && preview.fixes.wineserverConfig() == config)
+
+    try preview.fixes.uninstallAudio()  // e.g. a preview update wiped it
+    #expect(set.audioIOms() == nil)
+    try set.uninstallWineserver()
+    try set.uninstallAudio()
+    #expect(stable.fixes.wineserverConfig() == nil && preview.fixes.wineserverConfig() == nil)
+    #expect(stable.fixes.audioIOms() == nil)
 }

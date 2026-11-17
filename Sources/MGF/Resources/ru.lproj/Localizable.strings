@@ -233,3 +233,7 @@
 "lets mgf write the fixes into crossover. macos ties it to the app's signature and may ask again after an update" = "позволяет mgf записывать фиксы в crossover. macos привязывает его к подписи приложения и может запросить снова после обновления";
 "first-run setup" = "первичная настройка";
 "run setup again" = "пройти настройку заново";
+"also patch" = "также патчить";
+"crossover %@ · gets the same fixes" = "crossover %@ · получает те же фиксы";
+"remove" = "убрать";
+"add another crossover" = "добавить ещё crossover";

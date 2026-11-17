@@ -10,6 +10,7 @@ struct SetupView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     // crossover step
     @State private var path = ""
+    @State private var more: [String] = []          // further bundles found side by side: they get the fixes too
     @State private var scan: [TermLine] = []
     @State private var typing = false
     @State private var scanTask: Task<Void, Never>?
@@ -46,7 +47,10 @@ struct SetupView: View {
         }
         .background(Hax.bgPage)
         .onChange(of: step, initial: true) { _, step in
-            if step == 2 { scanCrossOver(model.crossover.map { tilde($0.bundle.path) } ?? model.settings.crossoverPath) }
+            if step == 2 {
+                let found = model.crossovers.map { tilde($0.bundle.path) }
+                scanCrossOver(found.first ?? model.settings.crossoverPath, more: Array(found.dropFirst()))
+            }
             if step == 3 { waiting = false }
             if step == Self.ready { login = model.loginItem }
         }
@@ -121,7 +125,7 @@ struct SetupView: View {
         switch step {
         case 0: return Action(title: L("start setup")) { go(1) }
         case 1: return Action(title: L("continue")) { go(2) }
-        case 2: return Action(title: L("continue"), enabled: !typing && model.crossoverProblem(path) == nil) { model.useCrossOver(path); go(3) }
+        case 2: return Action(title: L("continue"), enabled: !typing && model.crossoverProblem(path) == nil) { model.useCrossOver(path, more: more); go(3) }
         case 3: return Action(title: L("continue"), enabled: model.canPatch == true) { go(4) }
         case 4:
             if running { return Action(title: L("applying"), enabled: false, loading: true) }
@@ -225,37 +229,56 @@ struct SetupView: View {
                 HStack(alignment: .top, spacing: 8) {
                     HxInput(label: L("crossover app"), text: $path, prompt: true,
                             hint: typing ? nil : L("crossover %@ found", CrossOver(path: path).version ?? "?"), error: problem)
-                    HxButton(title: L("browse"), icon: "folder-open") { if let picked = chooseApplication() { scanCrossOver(picked) } }
+                    HxButton(title: L("browse"), icon: "folder-open") { if let picked = chooseApplication() { scanCrossOver(picked, more: more) } }
                         .padding(.top, 23)  // sits on the field's row, under the label
-                    HxButton(title: L("detect again"), icon: "scan-search") { scanCrossOver(CrossOver.detect().map { tilde($0.bundle.path) } ?? path) }
+                    HxButton(title: L("detect again"), icon: "scan-search") {
+                        let found = CrossOver.detectAll().map { tilde($0.bundle.path) }
+                        scanCrossOver(found.first ?? path, more: Array(found.dropFirst()))
+                    }
                         .padding(.top, 23)
+                }
+                .reveal(1)
+                ForEach(more, id: \.self) { extra in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        HxBadge(text: "+", tone: .info, bracket: true)
+                        Text(verbatim: extra).foregroundStyle(Hax.textSecondary).lineLimit(1).truncationMode(.middle)
+                        HxHint(L("crossover %@ · gets the same fixes", CrossOver(path: extra).version ?? "?"))
+                        Spacer()
+                        HxButton(title: L("remove"), variant: .ghost, small: true, icon: "x") { scanCrossOver(path, more: more.filter { $0 != extra }) }
+                    }
+                    .font(Hax.caption)
                 }
                 .reveal(1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             HxTerminal(title: "mgf — detect", lines: scan).frame(width: Self.side, height: 264).reveal(2)
         }
-        .onChange(of: path) { if !typing { scan = [TermLine(kind: .command, text: "mgf detect")] + lines(for: path) } }
+        .onChange(of: path) { if !typing { scan = [TermLine(kind: .command, text: "mgf detect")] + lines(for: [path] + more) } }
     }
 
-    private func lines(for path: String) -> [TermLine] {
-        if let problem = model.crossoverProblem(path) { return [TermLine(kind: .error, text: "[FAIL] " + problem)] }
-        let crossover = CrossOver(path: path), fixes = Fixes(crossover: crossover, payload: model.payload)
-        return [
-            TermLine(kind: .ok, text: "[ OK ] " + path),
-            TermLine(kind: .ok, text: "[ OK ] crossover " + (crossover.version ?? "?")),
-            TermLine(kind: .ok, text: "[ OK ] wineserver · " + (fixes.wineserverConfig() == nil ? L("stock") : L("patched"))),
-            TermLine(kind: .ok, text: "[ OK ] winecoreaudio.so · " + (fixes.audioIOms() == nil ? L("stock") : L("patched"))),
-        ]
+    /// Three lines per bundle, so a stable and a preview build both fit the terminal.
+    private func lines(for paths: [String]) -> [TermLine] {
+        paths.flatMap { path -> [TermLine] in
+            if let problem = model.crossoverProblem(path) { return [TermLine(kind: .error, text: "[FAIL] " + path + " · " + problem)] }
+            let crossover = CrossOver(path: path), fixes = Fixes(crossover: crossover, payload: model.payload)
+            let servers = crossover.wineservers.map(\.lastPathComponent).joined(separator: ", ")
+            let drivers = crossover.audioDrivers.count > 1 ? "winecoreaudio.so ×\(crossover.audioDrivers.count)" : "winecoreaudio.so"
+            return [
+                TermLine(kind: .ok, text: "[ OK ] " + path + " · crossover " + (crossover.version ?? "?")),
+                TermLine(kind: .ok, text: "[ OK ] " + servers + " · " + (fixes.wineserverConfig() == nil ? L("stock") : L("patched"))),
+                TermLine(kind: .ok, text: "[ OK ] " + drivers + " · " + (fixes.audioIOms() == nil ? L("stock") : L("patched"))),
+            ]
+        }
     }
 
-    /// Looks at the bundle under `newPath`; the findings arrive one line at a time, the way the activity log fills in.
-    private func scanCrossOver(_ newPath: String) {
+    /// Looks at the bundles under `newPath` and `extra`; the findings arrive one line at a time, the way the activity log fills in.
+    private func scanCrossOver(_ newPath: String, more extra: [String] = []) {
         scanTask?.cancel()
         typing = true
         path = newPath
+        more = extra.filter { $0 != newPath }
         scan = [TermLine(kind: .command, text: "mgf detect")]
-        let found = lines(for: newPath)
+        let found = lines(for: [newPath] + more)
         scanTask = Task { @MainActor in
             for line in found {
                 if !reduceMotion { try? await Task.sleep(for: .milliseconds(340)) }

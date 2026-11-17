@@ -32,15 +32,18 @@ public struct WineserverConfig: Equatable {
 
     static func quote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
-    var script: String {
+    var script: String { script(server: "wineserver") }
+
+    /// The wrapper that stands in for `bin/<server>` and runs `bin/<server>.real`.
+    func script(server: String) -> String {
         var env = "REGSAVE_BUSY_CPU=\(busyCpu) UDP_SERVICE_TYPE=\(udpService) "
         if let log, !log.isEmpty { env += "REGSAVE_LOG=\(Self.quote(log)) " }
         return """
         #!/bin/sh
-        # mgf: injects wineserver_fix.dylib into the Wine server. The untouched original is wineserver.orig.
+        # mgf: injects wineserver_fix.dylib into the Wine server. The untouched original is \(server).orig.
         # https://github.com/been-earth/mac-gaming-fixes
         d=$(dirname "$0")
-        \(env)DYLD_INSERT_LIBRARIES="$d/wineserver_fix.dylib" exec "$d/wineserver.real" "$@"
+        \(env)DYLD_INSERT_LIBRARIES="$d/wineserver_fix.dylib" exec "$d/\(server).real" "$@"
 
         """
     }
@@ -63,6 +66,7 @@ public struct WineserverConfig: Equatable {
 
 /// Installs and removes the two patches inside a CrossOver bundle. Every original file is kept
 /// next to its replacement, and new files are renamed into place so running games keep the old ones.
+/// A bundle with several Wine servers or unix library directories (CrossOver Preview) gets each one patched.
 public struct Fixes: @unchecked Sendable {
     public let crossover: CrossOver
     /// Directory holding wineserver_fix.dylib and the winecoreaudio.so wrapper.
@@ -72,84 +76,115 @@ public struct Fixes: @unchecked Sendable {
     public init(crossover: CrossOver, payload: URL) { self.crossover = crossover; self.payload = payload }
 
     private var bin: URL { crossover.bin }
-    private var unix: URL { crossover.unixLibs }
     private func exists(_ url: URL) -> Bool { fm.fileExists(atPath: url.path) }
+    private func sibling(_ url: URL, _ suffix: String) -> URL { url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + suffix) }
 
     // MARK: wineserver (registry save deferral + UDP tagging)
 
-    /// nil when the stock server is in place.
+    /// nil when a stock server is in place, or the servers do not all carry the same wrapper.
     public func wineserverConfig() -> WineserverConfig? {
-        guard exists(bin.appendingPathComponent("wineserver.orig")),
-              let handle = try? FileHandle(forReadingFrom: crossover.wineserver),
+        Self.agreed(crossover.wineservers.map(wineserverConfig(of:)))
+    }
+
+    private func wineserverConfig(of server: URL) -> WineserverConfig? {
+        guard exists(sibling(server, ".orig")),
+              let handle = try? FileHandle(forReadingFrom: server),
               let head = try? handle.read(upToCount: 4096), let script = String(data: head, encoding: .utf8) else { return nil }
         return WineserverConfig(script: script)
     }
 
     public func installWineserver(_ config: WineserverConfig) throws {
-        let server = crossover.wineserver
-        let orig = bin.appendingPathComponent("wineserver.orig")
-        let original = exists(orig) ? orig : server
-        if original == server {
-            guard exists(server) else { throw FixError.missing(server.path) }
+        let servers = crossover.wineservers
+        guard !servers.isEmpty else { throw FixError.missing(bin.appendingPathComponent("wineserver").path) }
+        // Check every server before touching any, so a bundle is never left half patched by a stranger's file.
+        for server in servers where !exists(sibling(server, ".orig")) {
             guard Self.isMachO(server) else { throw FixError.unexpected(server.path) }
         }
-        // The server itself is replaced last, so a failure on the way leaves CrossOver working.
         try place(payload.appendingPathComponent("wineserver_fix.dylib"), at: bin.appendingPathComponent("wineserver_fix.dylib"))
-        // The signed server has the hardened runtime, which ignores DYLD_INSERT_LIBRARIES: run an unsigned copy.
-        try place(original, at: bin.appendingPathComponent("wineserver.real")) { copy in
-            try Self.run("/usr/bin/xattr", ["-c", copy.path])
-            try Self.run("/usr/bin/codesign", ["--remove-signature", copy.path])
-        }
-        if original == server { try place(server, at: orig) }
         if let log = config.log, !log.isEmpty {
             try? fm.createDirectory(at: URL(fileURLWithPath: log).deletingLastPathComponent(), withIntermediateDirectories: true)
         }
-        try write(Data(config.script.utf8), to: server, mode: 0o755)
+        for server in servers { try installWineserver(config, at: server) }
         try? fm.removeItem(at: bin.appendingPathComponent("regsave_defer.dylib")) // name used by the first shell installer
     }
 
+    private func installWineserver(_ config: WineserverConfig, at server: URL) throws {
+        let orig = sibling(server, ".orig")
+        let original = exists(orig) ? orig : server
+        // The signed server has the hardened runtime, which ignores DYLD_INSERT_LIBRARIES: run a copy
+        // signed ad hoc, which has none. Apple silicon refuses to run arm64 code with no signature at all.
+        try place(original, at: sibling(server, ".real")) { copy in
+            try Self.run("/usr/bin/xattr", ["-c", copy.path])
+            try Self.run("/usr/bin/codesign", ["--force", "--sign", "-", copy.path])
+        }
+        if original == server { try place(server, at: orig) }
+        // The server itself is replaced last, so a failure on the way leaves CrossOver working.
+        try write(Data(config.script(server: server.lastPathComponent).utf8), to: server, mode: 0o755)
+    }
+
     public func uninstallWineserver() throws {
-        let orig = bin.appendingPathComponent("wineserver.orig")
-        guard exists(orig) else { return }
-        try rename(orig, to: crossover.wineserver)
-        for name in ["wineserver.real", "wineserver_fix.dylib", "regsave_defer.dylib"] {
+        var restored = false
+        for server in crossover.wineservers {
+            let orig = sibling(server, ".orig")
+            guard exists(orig) else { continue }
+            try rename(orig, to: server)
+            try? fm.removeItem(at: sibling(server, ".real"))
+            restored = true
+        }
+        guard restored else { return }
+        for name in ["wineserver_fix.dylib", "regsave_defer.dylib"] {
             try? fm.removeItem(at: bin.appendingPathComponent(name))
         }
     }
 
     // MARK: audio driver wrapper (IO buffer length)
 
-    private var audioConf: URL { unix.appendingPathComponent("mgf_audio_io_ms") }
-
-    /// IO buffer length the installed wrapper uses, nil when the stock driver is in place.
+    /// IO buffer length the installed wrappers use, nil when a stock driver is in place or they disagree.
     public func audioIOms() -> Double? {
+        Self.agreed(crossover.unixLibDirs.map(audioIOms(in:)))
+    }
+
+    private func audioIOms(in unix: URL) -> Double? {
         guard exists(unix.appendingPathComponent("winecoreaudio.so.orig")), exists(unix.appendingPathComponent("winecoreaudio_real.so")) else { return nil }
-        let text = (try? String(contentsOf: audioConf, encoding: .utf8)) ?? ""
+        let text = (try? String(contentsOf: unix.appendingPathComponent("mgf_audio_io_ms"), encoding: .utf8)) ?? ""
         return Double(text.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 512 * 1000.0 / 96000
     }
 
     public func installAudio(ioMs: Double) throws {
-        let driver = crossover.audioDriver
-        let orig = unix.appendingPathComponent("winecoreaudio.so.orig")
-        if !exists(orig) {
-            guard exists(driver) else { throw FixError.missing(driver.path) }
+        let dirs = crossover.unixLibDirs
+        guard !dirs.isEmpty else { throw FixError.missing(crossover.support.appendingPathComponent("lib/wine/x86_64-unix/winecoreaudio.so").path) }
+        // Check every driver before touching any.
+        for unix in dirs where !exists(unix.appendingPathComponent("winecoreaudio.so.orig")) {
+            let driver = unix.appendingPathComponent("winecoreaudio.so")
             // the real driver exports the unixlib call table; our wrapper only re-exports it
             guard let data = try? Data(contentsOf: driver), data.range(of: Data("__wine_unix_call_funcs".utf8)) != nil else {
                 throw FixError.unexpected(driver.path)
             }
-            try fm.copyItem(at: driver, to: orig)
         }
-        try place(orig, at: unix.appendingPathComponent("winecoreaudio_real.so"))
-        try write(Data("\(ioMs)\n".utf8), to: audioConf, mode: 0o644)
-        try place(payload.appendingPathComponent("winecoreaudio.so"), at: driver)
+        for unix in dirs {
+            let driver = unix.appendingPathComponent("winecoreaudio.so")
+            let orig = unix.appendingPathComponent("winecoreaudio.so.orig")
+            if !exists(orig) { try fm.copyItem(at: driver, to: orig) }
+            try place(orig, at: unix.appendingPathComponent("winecoreaudio_real.so"))
+            try write(Data("\(ioMs)\n".utf8), to: unix.appendingPathComponent("mgf_audio_io_ms"), mode: 0o644)
+            try place(payload.appendingPathComponent("winecoreaudio.so"), at: driver)
+        }
     }
 
     public func uninstallAudio() throws {
-        let orig = unix.appendingPathComponent("winecoreaudio.so.orig")
-        guard exists(orig) else { return }
-        try rename(orig, to: crossover.audioDriver)
-        try? fm.removeItem(at: unix.appendingPathComponent("winecoreaudio_real.so"))
-        try? fm.removeItem(at: audioConf)
+        for unix in crossover.unixLibDirs {
+            let orig = unix.appendingPathComponent("winecoreaudio.so.orig")
+            guard exists(orig) else { continue }
+            try rename(orig, to: unix.appendingPathComponent("winecoreaudio.so"))
+            try? fm.removeItem(at: unix.appendingPathComponent("winecoreaudio_real.so"))
+            try? fm.removeItem(at: unix.appendingPathComponent("mgf_audio_io_ms"))
+        }
+    }
+
+    /// The value every item agrees on; nil when one has none or two disagree.
+    static func agreed<T: Equatable>(_ values: [T?]) -> T? {
+        guard let first = values.first ?? nil, values.allSatisfy({ $0 == first }) else { return nil }
+        return first
     }
 
     // MARK: file plumbing
@@ -201,4 +236,22 @@ public struct Fixes: @unchecked Sendable {
                                 String(decoding: output, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
         }
     }
+}
+
+/// The same fixes kept in several CrossOver bundles side by side (say, a stable and a preview build):
+/// every change goes into each of them, and a fix counts as applied only when all of them carry it alike.
+public struct FixSet: @unchecked Sendable {
+    public let members: [Fixes]
+
+    public init(crossovers: [CrossOver], payload: URL) {
+        members = crossovers.map { Fixes(crossover: $0, payload: payload) }
+    }
+
+    public func wineserverConfig() -> WineserverConfig? { Fixes.agreed(members.map { $0.wineserverConfig() }) }
+    public func audioIOms() -> Double? { Fixes.agreed(members.map { $0.audioIOms() }) }
+
+    public func installWineserver(_ config: WineserverConfig) throws { for fixes in members { try fixes.installWineserver(config) } }
+    public func uninstallWineserver() throws { for fixes in members { try fixes.uninstallWineserver() } }
+    public func installAudio(ioMs: Double) throws { for fixes in members { try fixes.installAudio(ioMs: ioMs) } }
+    public func uninstallAudio() throws { for fixes in members { try fixes.uninstallAudio() } }
 }

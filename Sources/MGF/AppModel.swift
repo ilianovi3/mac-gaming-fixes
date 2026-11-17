@@ -84,6 +84,7 @@ struct Feature: Identifiable {
 
 struct Settings: Codable, Equatable {
     var crossoverPath = ""                           // empty: look in the usual places
+    var morePaths: [String]?                         // more bundles that get the same fixes (say, a preview build next to the stable one)
     var logPath = "~/Library/Logs/mgf/regsave.log"   // empty: no log
     var busyCpu = 5.0                                // percent of one core
     var udpClass = 3                                 // 3 interactive video, 4 voice
@@ -116,7 +117,8 @@ struct Settings: Codable, Equatable {
     var toasts: [Toast] = []
 
     // what the system looks like right now
-    private(set) var crossover: CrossOver?
+    private(set) var crossovers: [CrossOver] = []  // every bundle the fixes go into; the first is the one picked in settings
+    var crossover: CrossOver? { crossovers.first }
     private(set) var wineserver: WineserverConfig?
     private(set) var audioFix: Double?
     private(set) var canPatch: Bool?                // app management: macos lets us write into crossover. nil until asked
@@ -187,7 +189,7 @@ struct Settings: Codable, Equatable {
     var steamNative: Bool { appNames.contains("steam_osx") }
     var steamRunning: Bool { steamWine || steamNative }
     var payload: URL { Bundle.module.resourceURL!.appendingPathComponent("Payload") }
-    private var fixes: Fixes? { crossover.map { Fixes(crossover: $0, payload: payload) } }
+    private var fixes: FixSet? { crossovers.isEmpty ? nil : FixSet(crossovers: crossovers, payload: payload) }
 
     func isApplied(_ id: FeatureID) -> Bool {
         switch id {
@@ -220,8 +222,17 @@ struct Settings: Codable, Equatable {
     // MARK: looking at the system
 
     private func locateCrossOver() {
-        let chosen = settings.crossoverPath.isEmpty ? nil : CrossOver(path: settings.crossoverPath)
-        crossover = chosen.flatMap { $0.isValid ? $0 : nil } ?? (settings.crossoverPath.isEmpty ? CrossOver.detect() : nil)
+        var found: [CrossOver]
+        if settings.crossoverPath.isEmpty {
+            found = CrossOver.detectAll()  // nothing picked yet: every bundle in the usual places
+        } else {
+            found = [settings.crossoverPath].map(CrossOver.init(path:)).filter(\.isValid)
+            for path in settings.morePaths ?? [] {
+                let more = CrossOver(path: path)
+                if more.isValid, !found.contains(more) { found.append(more) }
+            }
+        }
+        crossovers = found
     }
 
     func refreshFixes() {
@@ -271,7 +282,7 @@ struct Settings: Codable, Equatable {
     private func take(_ snapshot: [ProcessEntry]) {
         runningNames = Set(snapshot.map(\.name))
         let wine = Set(snapshot.filter(\.isWine).map(\.name))
-        let server = !runningNames.isDisjoint(with: ["wineserver.real", "wineserver"])
+        let server = !runningNames.isDisjoint(with: CrossOver.serverNames.flatMap { [$0, $0 + ".real"] })
         if wine != wineNames { wineNames = wine }
         if server != wineRunning { wineRunning = server }
         if !server, !pending.isEmpty { pending = [] }
@@ -279,8 +290,8 @@ struct Settings: Codable, Equatable {
 
     private func reportStatus() {
         say(.command, "mgf status")
-        if let crossover {
-            say(.ok, "[ OK ] " + L("crossover %@ found", crossover.version ?? "?"))
+        if !crossovers.isEmpty {
+            for crossover in crossovers { say(.ok, "[ OK ] " + L("crossover %@ found", crossover.version ?? "?")) }
             for id in FeatureID.fixes {
                 isApplied(id) ? say(.ok, "[ OK ] " + Feature.get(id).title) : say(.output, "[SKIP] " + L("%@: not applied", Feature.get(id).title))
             }
@@ -431,8 +442,10 @@ struct Settings: Codable, Equatable {
     }
 
     /// The bundle picked in the setup: from here on the fixes go into this one.
-    func useCrossOver(_ path: String) {
+    /// `more`: further bundles that get the same fixes, such as a preview build next to the stable one.
+    func useCrossOver(_ path: String, more: [String] = []) {
         settings.crossoverPath = path
+        settings.morePaths = more
         locateCrossOver()
         refreshFixes()
         adoptDiskState()
@@ -440,7 +453,9 @@ struct Settings: Codable, Equatable {
 
     /// App Management has no API to ask: try, and see what macOS says (CrossOver.isWritable).
     func refreshPermission() {
-        let allowed = crossover?.isWritable
+        // one refusal is enough: every bundle has to take the fixes
+        let answers = crossovers.map(\.isWritable)
+        let allowed: Bool? = answers.contains(false) ? false : answers.contains(true) ? true : nil
         if allowed != canPatch { canPatch = allowed }
     }
 
@@ -475,10 +490,10 @@ struct Settings: Codable, Equatable {
 
     func apply(_ next: Settings, loginItem wantLogin: Bool) {
         let knobsChanged = next.busyCpu != settings.busyCpu || next.udpClass != settings.udpClass || next.logPath != settings.logPath || next.ioMs != settings.ioMs
-        let moved = next.crossoverPath != settings.crossoverPath
+        let moved = next.crossoverPath != settings.crossoverPath || (next.morePaths ?? []) != (settings.morePaths ?? [])
         if next.language != settings.language { languageBundle = bundle(forLanguage: next.language) }  // before anything reads a string
         settings = next
-        if moved { locateCrossOver(); refreshFixes() }
+        if moved { reapplied = false; locateCrossOver(); refreshFixes() }  // a bundle just added gets the fixes the others have
         setLoginItem(wantLogin)
         say(.ok, "[ OK ] " + L("settings saved"))
         guard live, knobsChanged, !appliedFixes.isEmpty else { toast(.success, L("settings saved")); return }
