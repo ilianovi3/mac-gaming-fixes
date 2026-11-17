@@ -442,12 +442,10 @@ struct Settings: Codable, Equatable {
     }
 
     /// The bundle picked in the setup: from here on the fixes go into this one.
-    func useCrossOver(_ path: String) {
+    /// `more`: further bundles that get the same fixes, such as a preview build next to the stable one.
+    func useCrossOver(_ path: String, more: [String] = []) {
         settings.crossoverPath = path
-        if settings.morePaths == nil {  // first pick: every other bundle found side by side gets the fixes too
-            let picked = CrossOver(path: path)
-            settings.morePaths = CrossOver.detectAll().filter { $0 != picked }.map { ($0.bundle.path as NSString).abbreviatingWithTildeInPath }
-        }
+        settings.morePaths = more
         locateCrossOver()
         refreshFixes()
         adoptDiskState()
